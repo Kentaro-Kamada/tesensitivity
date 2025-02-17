@@ -47,6 +47,11 @@ tesen_cpi <- function(data, treatment, outcome, covariates, qcovariates = NULL, 
     qmodel <- ""
   }
   
+  # calculate dimensions
+  nobs <- nrow(data)
+  K <- length(W)
+  nvars <- K + 2
+  
   # Process verbose + debug option
   verbose <- as.logical(verbose)
   debug <- as.logical(debug)
@@ -149,8 +154,9 @@ tesen_cpi <- function(data, treatment, outcome, covariates, qcovariates = NULL, 
   # 3. Calculate propensity score(s)
   # =========================================================================
   logit_model <- glm(as.formula(paste(X, "~", paste(W, collapse = "+"))), data = data, family = binomial)
-  pindex <- wsupp %*% coef(logit_model)
-  p1 <- plogis(pindex)
+  # pindex <- wsupp %*% coef(logit_model)
+  # p1 <- plogis(pindex)
+  p1 <- predict(logit_model, type = "response")
   p0 <- 1 - p1
   pmax <- max(c(p1, p0))
   
@@ -177,11 +183,10 @@ tesen_cpi <- function(data, treatment, outcome, covariates, qcovariates = NULL, 
       ynodes <- rbind(ynodes, coef(qreg_model))
       if (verbose) cat(".")
     }
-    
-    # if (debug) {
-    #   plot(xnodes, ynodes, main = "Quantile Function Interpolated")
-    # }
   }
+  
+  # pchip係数を計算します
+  pchipcoefs <- pchip_all_coef(xnodes, ynodes, nvars)
 
   # =========================================================================
   # 4.2 (Quantile stats: approximate quantile function limits)
@@ -283,7 +288,7 @@ tesen_cpi <- function(data, treatment, outcome, covariates, qcovariates = NULL, 
   } else if (stat == "ate" && binary_outcome) {
     c_function_args <- list(p0, p1, p10, p11)
   } else {
-    c_function_args <- list(p0, p1, wsupp, xnodes, ynodes, nvars, nobs)
+    c_function_args <- list(p0, p1, wsupp, pchipcoefs, nvars, nobs)
   }
   
   c_table <- matrix(NA, nrow = cnum, ncol = 2)
@@ -765,7 +770,7 @@ cqtl_arg_c <- function(c, p0, p1, qtl) {
 cate_integral_c <- function(c, p0, p1, cov, pchipcoefs, nvars, cate, catt) {
   int_segs <- matrix(NA, nrow = 8, ncol = 1)
   qtl_coef <- matrix(NA, nrow = 4, ncol = nvars)
-  n <- nrow(cov)
+  n <- length(cov)
   
   if (nvars > (n + 2)) {
     control_cov <- c(0, cov[1:(n - 1)], 0 * cov[1:(n - 1)], 1)
@@ -778,6 +783,10 @@ cate_integral_c <- function(c, p0, p1, cov, pchipcoefs, nvars, cate, catt) {
   limits <- qtl_bound(c, p0, p1)
   coef <- qtl_coef(c, p0, p1)
   
+  # calculate the integrals
+  # outer loop: covariates
+  # inner loop: intervals of integrals
+  # TODO: is there a more efficient way to do this to avoid inner loop?
   for (k in 1:nvars) {
     for (i in 1:8) {
       int_segs[i, 1] <- analyint(limits[i, 1], limits[i, 2], coef[i, 2], coef[i, 1], pchipcoefs[[k]])
@@ -837,29 +846,37 @@ qtl_coef <- function(c, p0, p1) {
 # FUNCTION: Quantile Bounds
 qtl_bound <- function(c, p0, p1) {
   if ((c < p0) & (c < p1)) {
-    bounds <- matrix(rep(0.5, 8), ncol = 2, byrow = TRUE)
+    bound1 <- 0.5
+    bound2 <- 0.5
+    bound3 <- 0.5
+    bound4 <- 0.5
   } else if ((p0 <= c) & (c < p1)) {
-    bounds <- matrix(c(
-      0, (1 - p1) / (1 - (p1 - c)),
-      0, 1 / (1 + (c / p0)),
-      0, c / (1 - (p1 - c)),
-      0, (c / p0) / (1 + c / p0)
-    ), ncol = 2, byrow = TRUE)
+    bound1 <- (1 - p1) / (1 - (p1 - c))
+    bound2 <- 1 / (1 + (c / p0))
+    bound3 <- c / (1 - (p1 - c))
+    bound4 <- (c / p0) / (1 + c / p0)
   } else if ((p1 <= c) & (c < p0)) {
-    bounds <- matrix(c(
-      0, (c / p1) / (1 + c / p1),
-      0, c / (1 - (p0 - c)),
-      0, 1 / (1 + (c / p1)),
-      0, (1 - p0) / (1 - (p0 - c))
-    ), ncol = 2, byrow = TRUE)
+    bound1 <- (c / p1) / (1 + c / p1)
+    bound2 <- c / (1 - (p0 - c))
+    bound3 <- 1 / (1 + (c / p1))
+    bound4 <- (1 - p0) / (1 - (p0 - c))
   } else if ((p0 <= c) & (p1 <= c)) {
-    bounds <- matrix(c(
-      0, p0,
-      0, p0,
-      0, p1,
-      0, p1
-    ), ncol = 2, byrow = TRUE)
+    bound1 <- p0
+    bound2 <- p0
+    bound3 <- p1
+    bound4 <- p1
   }
+  
+  bounds <- matrix(c(0, bound1,
+                     bound1, 1,
+                     0, bound2,
+                     bound2, 1,
+                     0, bound3,
+                     bound3, 1,
+                     0, bound4,
+                     bound4, 1), 
+                   ncol = 2, byrow = TRUE)
+  
   return(bounds)
 }
 
@@ -949,15 +966,18 @@ pchipval <- function(coef, u) {
 # FUNCTION: Analytical Integral
 analyint <- function(a, b, c, d, pchipcoef) {
   if (c == 0) {
+    # TODO: avoid recalculating each time...
     return((b - a) * pchipval(pchipcoef, d))
   }
   
+  # この部分で引っかかっている
+  
   lower_bound <- c * a + d
   upper_bound <- c * b + d
-  difflower <- lower_bound - pchipcoef[, 5]
-  diffupper <- upper_bound - pchipcoef[, 5]
+  difflower <- matrix(lower_bound, nrow = nrow(pchipcoef), ncol = 1) - pchipcoef[, 5]
+  diffupper <- matrix(upper_bound, nrow = nrow(pchipcoef), ncol = 1) - pchipcoef[, 5]
   indexlower <- which(difflower <= 0)[1]
-  indexupper <- which(diffupper >= 0)[length(which(diffupper >= 0))]
+  indexupper <- tail(which(diffupper >= 0), 1)
   
   if (indexlower == indexupper) {
     midint <- 0
